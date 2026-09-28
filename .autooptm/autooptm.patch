@@ -1,0 +1,150 @@
+diff --git a/bench_train.py b/bench_train.py
+new file mode 100644
+index 0000000..3889cf7
+--- /dev/null
++++ b/bench_train.py
+@@ -0,0 +1,12 @@
++import sys, runpy
++# scripts/train_stage1.sh points at train/run.py, an outdated path; the real entry is `python -m tabicl.train`.
++# Scaled down so one card can run it: stage 1 is originally max_steps=100000 / batch 512.
++if __name__ == "__main__":
++    sys.argv = ["tabicl.train",
++                "--device", "cuda", "--dtype", "bfloat16",
++                "--max_steps", "50", "--batch_size", "32", "--micro_batch_size", "4",
++                "--lr", "1e-4", "--scheduler", "cosine_warmup", "--warmup_proportion", "0.02",
++                "--gradient_clipping", "1.0",
++                "--prior_type", "mix_scm", "--prior_device", "cpu", "--batch_size_per_gp", "4",
++                "--np_seed", "42", "--torch_seed", "42", "--wandb_log", "False"]
++    runpy.run_module("tabicl.train", run_name="__main__")
+diff --git a/src/tabicl/_model/embedding.py b/src/tabicl/_model/embedding.py
+index 1144b5c..620ba5e 100644
+--- a/src/tabicl/_model/embedding.py
++++ b/src/tabicl/_model/embedding.py
+@@ -337,6 +337,12 @@ class ColEmbedding(nn.Module):
+ 
+         return (y.long() // divisor) % bases[digit_idx]
+ 
++    def _affine_tail(self, features: Tensor, src: Tensor) -> Tensor:
++        """Per-column affine: ``features * ln_w(out_w(src)) + ln_b(out_b(src))``."""
++        weights = self.ln_w(self.out_w(src))
++        biases = self.ln_b(self.out_b(src))
++        return features * weights + biases
++
+     def _compute_embeddings(
+         self, features: Tensor, train_size: int, y_train: Optional[Tensor] = None, embed_with_test: bool = False
+     ) -> Tensor:
+@@ -412,9 +418,7 @@ class ColEmbedding(nn.Module):
+                 src = src_accum / num_digits
+ 
+         if self.affine:
+-            weights = self.ln_w(self.out_w(src))
+-            biases = self.ln_b(self.out_b(src))
+-            embeddings = features * weights + biases
++            embeddings = self._affine_tail(features, src)
+         else:
+             embeddings = src
+ 
+diff --git a/src/tabicl/_model/layers.py b/src/tabicl/_model/layers.py
+index 02034d1..3381523 100644
+--- a/src/tabicl/_model/layers.py
++++ b/src/tabicl/_model/layers.py
+@@ -131,6 +131,8 @@ class SkippableLinear(nn.Linear):
+ 
+         out = F.linear(src, self.weight, self.bias)
+         skip_mask = (src == self.skip_value).all(dim=-1)
++        if self.training:
++            return torch.where(skip_mask.unsqueeze(-1), torch.full((), self.skip_value, dtype=out.dtype, device=out.device), out)
+         if skip_mask.any():
+             out[skip_mask] = self.skip_value
+ 
+@@ -671,6 +673,9 @@ class InducedSelfAttentionBlock(nn.Module):
+         """
+ 
+         skip_mask = (src == self.skip_value).all(dim=(-2, -1))  # batch shape
++        if self.training:
++            out = self.induced_attention(src, train_size).to(src.dtype)
++            return torch.where(skip_mask[..., None, None], torch.full((), self.skip_value, dtype=out.dtype, device=out.device), out)
+         if skip_mask.any():
+             if skip_mask.all():
+                 out = torch.full_like(src, self.skip_value)
+diff --git a/src/tabicl/train/_run.py b/src/tabicl/train/_run.py
+index 93321ff..36d5f8b 100644
+--- a/src/tabicl/train/_run.py
++++ b/src/tabicl/train/_run.py
+@@ -263,6 +263,22 @@ class Trainer:
+             model = torch.compile(model, dynamic=True)
+             if self.master_process:
+                 print("Model compiled successfully.")
++        elif "cuda" in str(self.config.device) and os.environ.get("TABICL_OPT_1", "1") == "1":
++            from torch._dynamo import config as dynamo_config
++            from tabicl._model.embedding import ColEmbedding
++            from tabicl._model.layers import MultiheadAttentionBlock
++
++            dynamo_config.cache_size_limit = max(dynamo_config.cache_size_limit, 64)
++            from tabicl._model.rope import RotaryEmbedding
++
++            if not hasattr(MultiheadAttentionBlock.forward, "_torchdynamo_orig_callable"):
++                MultiheadAttentionBlock.forward = torch.compile(MultiheadAttentionBlock.forward, dynamic=True)
++                ColEmbedding._affine_tail = torch.compile(ColEmbedding._affine_tail, dynamic=True)
++            rope_len = self.config.max_features + self.config.row_num_cls
++            pos_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}.get(self.config.dtype, torch.float32)
++            for m in model.modules():
++                if isinstance(m, RotaryEmbedding) and m.cache_if_possible and not m.learned_freq:
++                    m.forward(m.get_seq_pos(rope_len, device=m.device, dtype=pos_dtype if self.config.amp else torch.float32), seq_len=rope_len)
+ 
+         # Wrap model into DDP container if using distributed training
+         if self.ddp:
+@@ -361,6 +377,7 @@ class Trainer:
+                 lr=self.config.lr,
+                 betas=(self.config.beta1, self.config.beta2),
+                 weight_decay=self.config.weight_decay,
++                fused="cuda" in str(self.config.device) and os.environ.get("TABICL_OPT_2", "1") == "1",
+             )
+         self.scheduler = get_scheduler(config=self.config, optimizer=self.optimizer)
+ 
+@@ -552,8 +569,8 @@ class Trainer:
+                 results = self.run_batch(batch)
+             train_time = train_timer.elapsed
+ 
+-            # Clear CUDA cache to free memory
+-            torch.cuda.empty_cache()
++            if os.environ.get("TABICL_OPT_3", "0") == "1":
++                torch.cuda.empty_cache()
+ 
+             self.curr_step = step + 1
+             if self.master_process:
+@@ -728,11 +745,11 @@ class Trainer:
+         with torch.no_grad():
+             micro_results = {}
+             if self.regression:
+-                micro_results["pinball"] = scaled_loss.item()
++                micro_results["pinball"] = scaled_loss.detach().float()
+             else:
+-                micro_results["ce"] = scaled_loss.item()
++                micro_results["ce"] = scaled_loss.detach().float()
+                 accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
+-                micro_results["accuracy"] = accuracy.item() / num_micro_batches
++                micro_results["accuracy"] = accuracy.float() / num_micro_batches
+ 
+         return micro_results
+ 
+@@ -778,7 +795,7 @@ class Trainer:
+             try:
+                 micro_results = self.run_micro_batch(micro_batch, idx, num_micro_batches)
+                 for k, v in micro_results.items():
+-                    results[k] += v
++                    results[k] = results[k] + v
+             except torch.cuda.OutOfMemoryError:
+                 print(
+                     f"Warning: OOM error in micro-batch {idx+1}/{num_micro_batches} at step {self.curr_step}. Skipping."
+@@ -807,6 +824,10 @@ class Trainer:
+         self.optimizer.zero_grad(set_to_none=True)
+         self.scheduler.step()
+ 
++        # One device->host read for the step's metrics (see nosync in run_micro_batch)
++        keys = [k for k, v in results.items() if torch.is_tensor(v)]
++        if keys:
++            results.update(zip(keys, torch.stack([results[k] for k in keys]).tolist()))
+         return results
+ 
+ 

@@ -263,6 +263,22 @@ class Trainer:
             model = torch.compile(model, dynamic=True)
             if self.master_process:
                 print("Model compiled successfully.")
+        elif "cuda" in str(self.config.device) and os.environ.get("TABICL_OPT_1", "1") == "1":
+            from torch._dynamo import config as dynamo_config
+            from tabicl._model.embedding import ColEmbedding
+            from tabicl._model.layers import MultiheadAttentionBlock
+
+            dynamo_config.cache_size_limit = max(dynamo_config.cache_size_limit, 64)
+            from tabicl._model.rope import RotaryEmbedding
+
+            if not hasattr(MultiheadAttentionBlock.forward, "_torchdynamo_orig_callable"):
+                MultiheadAttentionBlock.forward = torch.compile(MultiheadAttentionBlock.forward, dynamic=True)
+                ColEmbedding._affine_tail = torch.compile(ColEmbedding._affine_tail, dynamic=True)
+            rope_len = self.config.max_features + self.config.row_num_cls
+            pos_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}.get(self.config.dtype, torch.float32)
+            for m in model.modules():
+                if isinstance(m, RotaryEmbedding) and m.cache_if_possible and not m.learned_freq:
+                    m.forward(m.get_seq_pos(rope_len, device=m.device, dtype=pos_dtype if self.config.amp else torch.float32), seq_len=rope_len)
 
         # Wrap model into DDP container if using distributed training
         if self.ddp:
@@ -361,6 +377,7 @@ class Trainer:
                 lr=self.config.lr,
                 betas=(self.config.beta1, self.config.beta2),
                 weight_decay=self.config.weight_decay,
+                fused="cuda" in str(self.config.device) and os.environ.get("TABICL_OPT_2", "1") == "1",
             )
         self.scheduler = get_scheduler(config=self.config, optimizer=self.optimizer)
 
@@ -552,8 +569,8 @@ class Trainer:
                 results = self.run_batch(batch)
             train_time = train_timer.elapsed
 
-            # Clear CUDA cache to free memory
-            torch.cuda.empty_cache()
+            if os.environ.get("TABICL_OPT_3", "0") == "1":
+                torch.cuda.empty_cache()
 
             self.curr_step = step + 1
             if self.master_process:
@@ -728,11 +745,11 @@ class Trainer:
         with torch.no_grad():
             micro_results = {}
             if self.regression:
-                micro_results["pinball"] = scaled_loss.item()
+                micro_results["pinball"] = scaled_loss.detach().float()
             else:
-                micro_results["ce"] = scaled_loss.item()
+                micro_results["ce"] = scaled_loss.detach().float()
                 accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
-                micro_results["accuracy"] = accuracy.item() / num_micro_batches
+                micro_results["accuracy"] = accuracy.float() / num_micro_batches
 
         return micro_results
 
@@ -778,7 +795,7 @@ class Trainer:
             try:
                 micro_results = self.run_micro_batch(micro_batch, idx, num_micro_batches)
                 for k, v in micro_results.items():
-                    results[k] += v
+                    results[k] = results[k] + v
             except torch.cuda.OutOfMemoryError:
                 print(
                     f"Warning: OOM error in micro-batch {idx+1}/{num_micro_batches} at step {self.curr_step}. Skipping."
@@ -807,6 +824,10 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         self.scheduler.step()
 
+        # One device->host read for the step's metrics (see nosync in run_micro_batch)
+        keys = [k for k, v in results.items() if torch.is_tensor(v)]
+        if keys:
+            results.update(zip(keys, torch.stack([results[k] for k in keys]).tolist()))
         return results
 
 

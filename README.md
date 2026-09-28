@@ -1,3 +1,74 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>TabICL · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>1.28x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-1.28x-2ea44f"></a>
+    <a href="https://github.com/soda-inria/tabicl/commit/0dbff3ec8fc68c123c87af77b0ea8b25cd2d23f3"><img alt="base" src="https://img.shields.io/badge/upstream-0dbff3ec8fc6-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%205090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [soda-inria/tabicl](https://github.com/soda-inria/tabicl) at commit
+> [`0dbff3ec8fc6`](https://github.com/soda-inria/tabicl/commit/0dbff3ec8fc68c123c87af77b0ea8b25cd2d23f3) with the AutoOptm patch applied on top.
+> **What is measured is TabICL pre-training** -- `python -m tabicl.train`, the trainer the README's
+> "Pre-training" section and `scripts/train_stage1.sh` launch -- driven by `bench_train.py`, a short
+> launcher that does not exist upstream and was added by this fork: the stage-1 recipe's prior and
+> optimiser settings, cut to 50 steps of batch 32 on one card in bf16.
+> Everything the trainer does is upstream code; the optimisation was found, measured and verified
+> automatically by [AutoOptm](https://autooptm.com), and the patch is kept at
+> [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python bench_train.py` (runs `python -m tabicl.train --device cuda --dtype bfloat16 --max_steps 50 --batch_size 32 --micro_batch_size 4 --lr 1e-4 --scheduler cosine_warmup --warmup_proportion 0.02 --gradient_clipping 1.0 --prior_type mix_scm --prior_device cpu --batch_size_per_gp 4 --np_seed 42 --torch_seed 42 --wandb_log False`) |
+| **Entry point** | `bench_train.py` (added by this fork) → `tabicl.train` |
+| **Unit measured** | one optimizer step: a batch of 32 synthetic tables drawn from the mix-SCM prior on the CPU, 8 micro-batches of forward and backward through the column, row and ICL transformers, gradient clipping and the AdamW step |
+| **Before (stock)** | 994 ms per step (median; 46.94 s for the timed loop) |
+| **After (this tree, all switches default ON)** | 501 ms per step (median; 36.60 s for the timed loop, which includes a one-time start-up cost the optimized tree pays in its first steps) |
+| **Speedup** | **1.28x** end to end on RTX 5090 (the whole timed loop; median per step 1.99x), noise floor of the host 0.12% |
+| **Output** | the per-step training loss within 2e-5 relative of the stock program's -- the stock program's own repeat-run spread -- and within 5e-8 on held-out batches; gradients cosine 1.0, relative L2 8e-4, far inside the bf16 rounding the command already trains under |
+
+### What changed
+
+| File | Where | Gain |
+|---|---|---|
+| `src/tabicl/train/_run.py`, `src/tabicl/_model/embedding.py` | `Trainer.build_model()`; `ColEmbedding` | 1.66x |
+| `src/tabicl/train/_run.py` | `Trainer.train()`: the step loop | 1.30x |
+| `src/tabicl/_model/embedding.py` | `ColEmbedding`: the per-column affine | 1.083x |
+| `src/tabicl/_model/layers.py` | `SkippableLinear.forward`, `InducedSelfAttentionBlock.forward` | 1.044x |
+| `src/tabicl/train/_run.py` | `Trainer.run_micro_batch()` / `run_batch()` | 1.025x |
+| `src/tabicl/train/_run.py` | `Trainer.configure_optimizer()` | 1.007x |
+| `bench_train.py` | module top level: `if __name__ == "__main__":` | — (the trainer starts its data workers with `spawn`, which re-imports the launcher; without the guard it could not get past the first batch) |
+
+Each gain is that change's step on the measurement ladder, not its effect alone. Every change in
+`src/` sits behind an environment switch, default ON.
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/tabicl-ao.git
+cd tabicl-ao
+# install PyTorch with CUDA as upstream documents, then:
+pip install -e .
+python bench_train.py
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it. It adds `bench_train.py` (added
+by this fork) and changes the files in the table; `git diff 0dbff3ec8fc6` is the same change as
+`.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 [![test](https://github.com/soda-inria/tabicl/actions/workflows/testing.yml/badge.svg)](https://github.com/soda-inria/tabicl/actions/workflows/testing.yml)
 [![PyPI version](https://badge.fury.io/py/tabicl.svg)](https://badge.fury.io/py/tabicl)
 [![Downloads](https://img.shields.io/pypi/dm/tabicl)](https://pypistats.org/packages/tabicl)

@@ -337,6 +337,12 @@ class ColEmbedding(nn.Module):
 
         return (y.long() // divisor) % bases[digit_idx]
 
+    def _affine_tail(self, features: Tensor, src: Tensor) -> Tensor:
+        """Per-column affine: ``features * ln_w(out_w(src)) + ln_b(out_b(src))``."""
+        weights = self.ln_w(self.out_w(src))
+        biases = self.ln_b(self.out_b(src))
+        return features * weights + biases
+
     def _compute_embeddings(
         self, features: Tensor, train_size: int, y_train: Optional[Tensor] = None, embed_with_test: bool = False
     ) -> Tensor:
@@ -412,9 +418,7 @@ class ColEmbedding(nn.Module):
                 src = src_accum / num_digits
 
         if self.affine:
-            weights = self.ln_w(self.out_w(src))
-            biases = self.ln_b(self.out_b(src))
-            embeddings = features * weights + biases
+            embeddings = self._affine_tail(features, src)
         else:
             embeddings = src
 

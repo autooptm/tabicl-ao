@@ -131,6 +131,8 @@ class SkippableLinear(nn.Linear):
 
         out = F.linear(src, self.weight, self.bias)
         skip_mask = (src == self.skip_value).all(dim=-1)
+        if self.training:
+            return torch.where(skip_mask.unsqueeze(-1), torch.full((), self.skip_value, dtype=out.dtype, device=out.device), out)
         if skip_mask.any():
             out[skip_mask] = self.skip_value
 
@@ -671,6 +673,9 @@ class InducedSelfAttentionBlock(nn.Module):
         """
 
         skip_mask = (src == self.skip_value).all(dim=(-2, -1))  # batch shape
+        if self.training:
+            out = self.induced_attention(src, train_size).to(src.dtype)
+            return torch.where(skip_mask[..., None, None], torch.full((), self.skip_value, dtype=out.dtype, device=out.device), out)
         if skip_mask.any():
             if skip_mask.all():
                 out = torch.full_like(src, self.skip_value)
